@@ -10,7 +10,7 @@ It is designed to reduce image size, minimize the attack surface, and retrieve G
 
 ### Stage 1: Builder
 
-Base image: `golang:1.24-alpine`
+Base image: `golang:1.24-alpine`   ## if we are using JAVA we should need to change base image and build process
 
 The builder stage:
 
