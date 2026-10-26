@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Runbooks
 
 Every alert carries a `runbook_url` annotation that points to one of these files.
@@ -66,3 +67,7 @@ Always add a comment and a short expiry.
 3. Engineering manager, if a customer-facing outage lasts more than 30 minutes
 
 Fill in names, rota links and phone numbers for your team here.
+=======
+# tdb-devops-handson
+tdb-devops-handson test process
+>>>>>>> fbff5bd751abecfd4cec574e00227fb168b2007b
