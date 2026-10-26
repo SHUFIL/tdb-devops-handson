@@ -1,0 +1,260 @@
+# EKS + PostgreSQL RDS on AWS (Terraform)
+
+Terraform project that builds an Amazon EKS cluster, a VPC, and a PostgreSQL RDS
+database for **dev** and **prod** environments, using our own modules (no community
+modules). State is stored in **S3 with DynamoDB locking**.
+
+## What gets created
+
+| Layer | Resources |
+|---|---|
+| Network (`modules/vpc`) | VPC, public + private subnets across AZs, Internet Gateway, NAT Gateway(s), route tables, EKS subnet tags |
+| EKS (`modules/eks`) | Control plane, IAM roles, managed node group, OIDC provider (IRSA), add-ons: `vpc-cni`, `kube-proxy`, `coredns` |
+| Database (`modules/rds`) | PostgreSQL 16, encrypted (KMS), Multi-AZ (prod), auto-rotated password in Secrets Manager, 7-day automated backups, optional same-region and cross-region read replicas |
+
+### Environment differences
+
+| | dev | prod |
+|---|---|---|
+| Region | ap-south-1 | ap-south-1 |
+| AZs | 2 | 3 |
+| NAT gateways | 1 (shared) | 1 per AZ |
+| Worker nodes | t3.medium, SPOT, 1-3 | m5.large, ON_DEMAND, 3-6 |
+| EKS API access | 0.0.0.0/0 | restricted CIDR |
+| RDS | db.t4g.micro, single AZ | db.m6g.large, Multi-AZ |
+| DR replica (ap-southeast-1) | off | on |
+
+## Repository layout
+
+```
+.
+├── bootstrap/          # one-time: S3 state bucket + DynamoDB lock table
+├── modules/
+│   ├── vpc/
+│   ├── eks/
+│   └── rds/
+└── envs/
+    ├── dev/            # backend.tf, terraform.tfvars, main.tf, ...
+    └── prod/
+```
+
+Each environment has its **own state file** (`eks/dev/terraform.tfstate`,
+`eks/prod/terraform.tfstate`) and its own `terraform.tfvars`. The `.tf` files in
+`envs/dev` and `envs/prod` are identical; only `backend.tf` and `terraform.tfvars` differ.
+
+## Prerequisites
+
+- Terraform >= 1.5
+- AWS CLI v2, configured (`aws configure` or SSO) with permissions for
+  EKS, EC2/VPC, IAM, RDS, KMS, Secrets Manager, S3, DynamoDB
+- `kubectl`
+- Verify your identity and region before you start:
+
+```bash
+aws sts get-caller-identity
+aws configure get region
+```
+
+---
+
+## Step 1: Create the remote backend (once per AWS account)
+
+The S3 bucket and DynamoDB table must exist before the environments can use them.
+This step uses local state, and only needs to be run once.
+
+```bash
+cd bootstrap
+terraform init
+terraform apply -var="state_bucket_name=<globally-unique-bucket-name>"
+```
+
+Optional variables: `-var="region=ap-south-1"`, `-var="lock_table_name=terraform-state-locks"`.
+
+Created: a versioned, encrypted, non-public S3 bucket and a `terraform-state-locks`
+DynamoDB table (key `LockID`, pay-per-request).
+
+## Step 2: Point the environments at the backend
+
+Backend blocks cannot use variables, so edit both files and replace the placeholder
+bucket name with the one from Step 1:
+
+- `envs/dev/backend.tf`
+- `envs/prod/backend.tf`
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket         = "<your-bucket-name>"          # <- change
+    key            = "eks/dev/terraform.tfstate"   # prod: eks/prod/terraform.tfstate
+    region         = "ap-south-1"
+    dynamodb_table = "terraform-state-locks"
+    encrypt        = true
+  }
+}
+```
+
+## Step 3: Review the environment settings
+
+Edit `envs/<env>/terraform.tfvars`. Items to check:
+
+- `public_access_cidrs` (**prod**): replace the placeholder `203.0.113.0/24` with your
+  office/VPN CIDR. Restrict dev too if possible.
+- `cluster_version`: EKS Kubernetes version.
+- `dr_region`: defaults to `ap-southeast-1`. Opt-in regions (e.g. `ap-south-2`) must be
+  enabled in your account first.
+- `db_deletion_protection`: `false` by default so `terraform destroy` works.
+  **Set to `true` for real production.**
+
+## Step 4: Deploy dev
+
+```bash
+cd envs/dev
+terraform init
+terraform plan -out=dev.tfplan
+terraform apply dev.tfplan
+```
+
+Typical duration: EKS ~10-15 min, RDS ~10 min (cross-region replica adds ~15-20 min in prod).
+
+## Step 5: Connect to the cluster
+
+The `kubeconfig_cmd` output has the exact command:
+
+```bash
+aws eks update-kubeconfig --region ap-south-1 --name eks-dev
+kubectl get nodes
+kubectl get pods -n kube-system
+```
+
+Expected: nodes in `Ready` state; `coredns`, `kube-proxy`, `aws-node` pods `Running`.
+
+> The identity that ran `terraform apply` is automatically granted cluster-admin.
+> Other users/roles must be added through EKS access entries
+> (`aws_eks_access_entry` + `aws_eks_access_policy_association`, not included in this project).
+
+## Step 6: Deploy prod
+
+```bash
+cd envs/prod
+terraform init
+terraform plan -out=prod.tfplan
+terraform apply prod.tfplan
+aws eks update-kubeconfig --region ap-south-1 --name eks-prod
+```
+
+Always read the plan before applying prod.
+
+---
+
+## Using the database
+
+Outputs after apply:
+
+| Output | Meaning |
+|---|---|
+| `db_endpoint` | Primary writer endpoint |
+| `db_secret_arn` | Secrets Manager secret with the master credentials |
+| `db_read_replica` | Same-region replica (if enabled) |
+| `db_dr_replica` | Cross-region replica (prod) |
+
+The master password is generated by RDS and **rotated automatically** (default every
+7 days). It never appears in code or Terraform state. Applications should read it from
+Secrets Manager (e.g. External Secrets Operator or the Secrets Store CSI driver with IRSA),
+not hardcode it.
+
+Quick connectivity test from inside the cluster:
+
+```bash
+# get credentials
+aws secretsmanager get-secret-value --secret-id <db_secret_arn> \
+  --query SecretString --output text      # JSON with username + password
+
+# run a throwaway psql pod
+kubectl run psql --rm -it --image=postgres:16 --restart=Never -- \
+  psql "host=<db_endpoint> user=dbadmin dbname=appdb sslmode=require"
+```
+
+Change the rotation schedule:
+
+```bash
+aws secretsmanager rotate-secret --secret-id <db_secret_arn> \
+  --rotation-rules AutomaticallyAfterDays=30
+```
+
+### Backups
+
+- Automated daily backups, **7-day retention**; older backups are deleted automatically.
+- On `terraform destroy`, automated backups are deleted too and no final snapshot is taken.
+  Take a manual snapshot first if you need to keep data.
+
+### Disaster recovery (prod)
+
+The cross-region replica is **read-only** and replicates continuously. To fail over:
+
+1. Promote the replica:
+   `aws rds promote-read-replica --db-instance-identifier eks-prod-postgres-dr --region ap-southeast-1`
+2. Create credentials for the promoted instance (it does not inherit the managed secret).
+3. Repoint applications to the promoted instance's endpoint.
+
+No network link (VPC peering / Transit Gateway) exists between the two regions;
+add one if apps in the primary region need to reach the DR database.
+
+---
+
+## Day-2 operations
+
+```bash
+terraform output                 # show endpoints / ARNs
+terraform plan                   # detect drift
+terraform state list             # inspect managed resources
+```
+
+- **Scale nodes**: change `node_*_size` in tfvars, then apply. `desired_size` is ignored
+  after creation so an autoscaler can own it; change min/max instead, or scale with
+  the AWS console/CLI.
+- **Upgrade Kubernetes**: bump `cluster_version` by **one minor version at a time**,
+  apply (control plane), then the node group rolls automatically. Do dev first.
+- **Postgres minor upgrades**: automatic (`auto_minor_version_upgrade`).
+
+## Destroying an environment
+
+1. **Delete Kubernetes-created AWS resources first** (otherwise VPC deletion hangs on
+   orphaned load balancers/ENIs):
+
+   ```bash
+   kubectl delete svc --all-namespaces --field-selector spec.type=LoadBalancer
+   kubectl delete ingress --all --all-namespaces
+   ```
+
+2. Destroy:
+
+   ```bash
+   cd envs/dev
+   terraform destroy
+   ```
+
+3. Destroy `envs/prod` the same way **only if you truly intend to**. If you enabled
+   `db_deletion_protection`, set it to `false` and apply before destroying.
+
+The `bootstrap/` bucket has `prevent_destroy`; remove that lifecycle block and empty
+the bucket (all versions) manually if you ever need to delete the backend.
+
+## Troubleshooting
+
+| Symptom | Likely cause / fix |
+|---|---|
+| `Error acquiring the state lock` | Another run is active, or a crashed run left a lock. Confirm nobody is applying, then `terraform force-unlock <LOCK_ID>` |
+| `Backend configuration changed` | Bucket/key edited in `backend.tf`. Run `terraform init -reconfigure` (or `-migrate-state` to move existing state) |
+| `AccessDenied` on S3/DynamoDB at init | Your IAM identity needs access to the state bucket and lock table |
+| `kubectl`: `Unauthorized` / `You must be logged in` | Wrong AWS profile. Use the identity that created the cluster, or add an access entry for yours |
+| Nodes stuck `NotReady` / node group `CREATE_FAILED` | Private subnets need NAT egress (dev/prod have it); check NAT and route tables |
+| `InvalidParameterCombination` on RDS | Instance class or version not available in the region/AZ. Pick another class or check `aws rds describe-orderable-db-instance-options` |
+| Cannot reach DB from a pod | Confirm the pod is on nodes using the EKS cluster SG, and `sslmode=require` is set |
+| VPC destroy hangs on dependencies | Orphaned ELBs/ENIs from Kubernetes services. Delete them (see Destroy step 1) |
+| Cross-region replica creation fails | Make sure the DR region is enabled in your account and the primary has backups enabled (retention > 0) |
+
+
+
+The biggest recurring costs are NAT gateways (3 in prod), the EKS control plane
+(~$0.10/hr per cluster), worker nodes, and the Multi-AZ + cross-region RDS instances.
+Run `terraform destroy` on dev when it is not in use.
