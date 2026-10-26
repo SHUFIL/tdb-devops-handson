@@ -1,0 +1,358 @@
+# Terraform on AWS with Claude Code (Windows 11 laptop as a client machine )
+
+This project manages AWS infrastructure with Terraform. Claude Code (running on Amazon Bedrock) helps write and run the code, AWS access uses SSO (no long-lived keys), and the code is stored in GitHub.
+
+> Replace every `YOUR-...` placeholder with your own value. Never commit access keys, passwords, tokens, `.tfvars` with secrets, or `.tfstate` files.
+
+---
+
+## 1. Architecture
+
+| Piece | Purpose |
+|---|---|
+| Terraform | Creates AWS resources from `.tf` files |
+| S3 remote state bucket | Stores `terraform.tfstate` safely, with versioning and locking |
+| AWS IAM Identity Center (SSO) | Short-lived AWS credentials, no access keys on the laptop |
+| Claude Code | Terminal AI assistant that writes code and runs commands (with your approval) |
+| Amazon Bedrock | Hosts the Claude model, billed on the AWS bill |
+| Terraform MCP server (Docker) | Gives Claude accurate Terraform provider and module docs |
+| Git + GitHub CLI (`gh`) | Version control and pushing code |
+
+Note: the MCP server only looks up documentation. It does not run `terraform apply`. Terraform commands run in your terminal or through Claude Code with your approval.
+
+---
+
+## 2. Prerequisites (PowerShell)
+
+```powershell
+winget install Hashicorp.Terraform
+winget install Amazon.AWSCLI
+winget install Git.Git
+winget install GitHub.cli
+winget install Docker.DockerDesktop
+winget install Anthropic.ClaudeCode
+```
+
+Close PowerShell and open a **new** window after installing, because PATH only updates in new windows. Verify:
+
+```powershell
+terraform -version     # 1.10 or newer
+aws --version
+git --version
+gh --version
+docker --version
+claude --version
+```
+
+### If a command is "not recognized"
+
+1. Find the program, for example Terraform:
+   ```powershell
+   Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Recurse -Filter terraform.exe | Select-Object FullName
+   ```
+2. Add its folder to PATH permanently:
+   ```powershell
+   $tf = "C:\path\to\folder"
+   [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path","User") + ";$tf", "User")
+   ```
+3. Open a new PowerShell window. Restart Windows if it still fails.
+
+### Docker Desktop needs WSL 2
+
+```powershell
+wsl --install --no-distribution
+wsl --update
+```
+
+Restart Windows, open Docker Desktop, and wait for **Engine running**. If it fails, enable virtualization (Intel VT-x / AMD SVM) in BIOS.
+
+---
+
+## 3. AWS SSO setup
+
+### 3.1 In the AWS console (once)
+
+1. Open **IAM Identity Center** and click **Enable**.
+2. **Users**: create your user.
+3. **Permission sets**: create one (for example `AdministratorAccess` for testing, `ReadOnlyAccess` for inspecting).
+4. **AWS accounts**: select your account, **Assign users or groups**, choose your user and the permission set.
+5. Note the **AWS access portal URL** (`https://d-xxxxxxxxxx.awsapps.com/start`) and the Identity Center region.
+
+If the CLI says `No AWS accounts are available to you`, the user has no account assignment. Complete step 4.
+
+### 3.2 Configure the CLI profile (once)
+
+```powershell
+aws configure sso
+```
+
+Enter a session name, the portal URL, the SSO region, and accept the default scopes. Log in through the browser, pick the account and role, and name the profile `dev`.
+
+### 3.3 Daily login
+
+```powershell
+aws sso login --profile dev
+aws sts get-caller-identity --profile dev
+```
+
+When Terraform or the CLI reports an expired token, run `aws sso login --profile dev` again.
+
+---
+
+## 4. Remote state bucket (create once with the CLI)
+
+The state bucket must exist before Terraform can use it, so create it manually:
+
+```powershell
+$bucket = "YOUR-UNIQUE-STATE-BUCKET-NAME"
+
+aws s3api create-bucket --bucket $bucket --region ap-south-1 --create-bucket-configuration LocationConstraint=ap-south-1 --profile dev
+
+aws s3api put-bucket-versioning --bucket $bucket --versioning-configuration Status=Enabled --profile dev
+
+aws s3api put-public-access-block --bucket $bucket --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true --profile dev
+```
+
+This bucket is not managed by this project, so `terraform destroy` will not remove it. Empty it (including old versions) and delete it manually when no longer needed.
+
+---
+
+## 5. Terraform files
+
+### `versions.tf`
+
+Backend blocks cannot use variables, so type the bucket name directly.
+
+```hcl
+terraform {
+  required_version = ">= 1.10.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+
+  backend "s3" {
+    bucket       = "YOUR-UNIQUE-STATE-BUCKET-NAME"
+    key          = "demo/terraform.tfstate"
+    region       = "ap-south-1"
+    profile      = "dev"
+    encrypt      = true
+    use_lockfile = true
+  }
+}
+```
+
+### `providers.tf`
+
+```hcl
+provider "aws" {
+  region  = "ap-south-1"
+  profile = "dev"
+}
+```
+
+### `main.tf`
+
+Example resources (use a different, globally unique bucket name):
+
+```hcl
+resource "aws_s3_bucket" "demo" {
+  bucket = "YOUR-UNIQUE-DEMO-BUCKET-NAME"
+}
+
+resource "aws_s3_bucket_public_access_block" "demo" {
+  bucket                  = aws_s3_bucket.demo.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+```
+
+### Run Terraform
+
+```powershell
+cd C:\terraform\demo
+aws sso login --profile dev
+terraform init
+terraform fmt
+terraform validate
+terraform plan
+terraform apply
+```
+
+Always read the plan before applying. Run `terraform destroy` to remove test resources.
+
+---
+
+## 6. Claude Code with Amazon Bedrock
+
+### 6.1 Enable Anthropic models in Bedrock (once per account)
+
+In the Bedrock console (region `us-east-1`), open the **Model catalog**, select an Anthropic model, and open it in the **Playground**. Send a message. If prompted, fill in the Anthropic use case form. Approval can take up to 15 minutes.
+
+The CLI error `Model use case details have not been submitted for this account` means this form is not done yet.
+
+Test from the CLI:
+
+```powershell
+'[{"role":"user","content":[{"text":"hi"}]}]' | Out-File msg.json -Encoding ascii
+aws bedrock-runtime converse --model-id us.anthropic.claude-sonnet-4-5-20250929-v1:0 --messages file://msg.json --region us-east-1 --profile dev
+Remove-Item msg.json
+```
+
+### 6.2 Connect Claude Code
+
+```powershell
+aws sso login --profile dev
+cd C:\terraform\demo
+claude
+```
+
+At the login prompt choose **3rd-party platform, then Amazon Bedrock**. Choose **Pin the working models** and **Save**. The wizard writes `~\.claude\settings.json` with settings like:
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_USE_BEDROCK": "1",
+    "AWS_REGION": "us-east-1",
+    "AWS_PROFILE": "dev",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+  }
+}
+```
+
+- **Sonnet** is the main model for writing code. **Haiku** handles small background tasks.
+- Choose **Yes, I trust this folder** only for your own project folder (`C:\terraform\demo`), never for broad folders such as your home directory.
+- Use `/model` to check or switch models, and `/setup-bedrock` to rerun the wizard.
+- Bedrock bills per token. Set an AWS Budgets alert.
+
+### 6.3 Resume earlier work
+
+Sessions are saved per folder. From `C:\terraform\demo`:
+
+```powershell
+claude --continue    # reopen the latest session
+claude --resume      # choose from a list
+```
+
+Your Terraform files stay in the folder either way.
+
+### Troubleshooting Claude Code
+
+| Problem | Fix |
+|---|---|
+| `model is not available on your bedrock deployment` | Submit the use case form (6.1); run `/model`; remove stale `ANTHROPIC_MODEL` env variables and open a new PowerShell window |
+| `Terraform is not found in my shell` | Start `claude` from a new PowerShell window where `terraform -version` works, or run `! terraform plan` inside Claude Code |
+| Expired token | `aws sso login --profile dev` |
+
+---
+
+## 7. Terraform MCP server (Claude Desktop, optional)
+
+Docker Desktop must be running. Add the server to `%APPDATA%\Claude\claude_desktop_config.json` **inside the existing top-level object** (a second top-level `{ }` makes the file invalid JSON):
+
+```json
+{
+  "mcpServers": {
+    "terraform": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "hashicorp/terraform-mcp-server"]
+    }
+  }
+}
+```
+
+If Claude Desktop cannot find Docker, use the full path: `C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe`.
+
+For Claude Code, register it with:
+
+```powershell
+claude mcp add terraform -s user -t stdio -- docker run -i --rm hashicorp/terraform-mcp-server
+```
+
+Fully quit and reopen Claude Desktop afterwards, then check **Settings, Developer** for `terraform` running.
+
+---
+
+## 8. Git and GitHub
+
+### 8.1 One-time setup
+
+```powershell
+git config --global user.name "Your Name"
+git config --global user.email "you@example.com"
+gh auth login
+gh auth status
+```
+
+For `gh auth login` choose **GitHub.com, HTTPS, Yes (authenticate Git), Login with a web browser**. This avoids typing passwords or pasting tokens in the terminal.
+
+### 8.2 `.gitignore` (create before the first commit)
+
+```
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*.tfplan
+msg.json
+.claude/
+```
+
+Commit `.terraform.lock.hcl`. It pins provider versions.
+
+### 8.3 Push manually
+
+```powershell
+cd C:\terraform\demo
+git init -b main
+git add .
+git status
+git commit -m "Initial Terraform setup"
+gh repo create terraform-demo --private --source=. --remote=origin --push
+```
+
+Check the `git status` list first. It should contain only `.tf` files, `.gitignore` and `.terraform.lock.hcl`. If `.terraform/` or any `.tfstate` file appears, fix `.gitignore` before committing.
+
+### 8.4 Push with Claude Code
+
+Start `claude` in the project folder and ask:
+
+> Create a Terraform .gitignore, run git status so I can review it, then wait for my OK. After that, commit with a clear message, create a private GitHub repo called terraform-demo with gh, and push.
+
+For later changes:
+
+> Create a branch called add-feature-name, commit my changes, push it, and open a pull request with gh.
+
+---
+
+## 9. Daily workflow
+
+```powershell
+aws sso login --profile dev
+cd C:\terraform\demo
+claude
+```
+
+Then ask Claude to make changes, run `terraform fmt`, `validate` and `plan`, review the plan yourself, approve `apply` only when it looks right, and finally commit and push through a branch and pull request.
+
+---
+
+## 10. Safety checklist
+
+- Use a test account and the least privilege you need. Do not use root credentials.
+- Never turn on auto-approve for `terraform apply`, `terraform destroy`, or Git push.
+- Read every `terraform plan` before applying.
+- Never commit secrets or state files. If a secret is committed by mistake, rotate it immediately, because deleting the file does not remove it from Git history.
+- Keep the repository private, since infrastructure code can reveal account details.
+- Turn on CloudTrail and set an AWS Budgets alert.
+- Run `terraform destroy` for test resources when finished.
